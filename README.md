@@ -27,6 +27,14 @@ clang -O3 full_trained_egg.c -o egg
 ./egg
 ```
 
+#### Linux / x86 CPU (AVX2 + Pthreads)
+```bash
+clang -O3 -mavx2 -mfma -pthread full_trained_egg.c -o egg
+./egg
+```
+
+If you want to use OpenMP instead of the built-in thread pool, install Clang's OpenMP runtime (e.g., `sudo apt-get install libomp-dev`) and add `-fopenmp` to the compile command.
+
 #### NVIDIA GPU (CUDA)
 ```bash
 nvcc -O3 full_cuda_train_egg.cu -o egg_cuda
