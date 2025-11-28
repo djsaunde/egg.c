@@ -56,6 +56,7 @@ If you want to use OpenMP instead of the built-in thread pool, install Clang's O
 Useful environment variables when benchmarking:
 
 - `EGGROLL_THREADS=8` caps the pthread worker pool (defaults to detected core count).
+- On AVX-512 builds the default is `max(1, cores/2)` to avoid frequency clipping; set `EGGROLL_THREADS` to override.
 - `EGGROLL_MAX_STEPS=1` exits after a single training iteration.
 - `EGGROLL_SAMPLE_INTERVAL=5` reduces how often samples/loss are printed.
 - `EGGROLL_REPORT_INTERVAL=1` together with `EGGROLL_PERF_LOG=1` prints post-step aggregate tok/s.

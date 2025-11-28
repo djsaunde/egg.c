@@ -383,9 +383,17 @@ static void init_thread_config_hint(void) {
     long hw_threads = sysconf(_SC_NPROCESSORS_ONLN);
     if (hw_threads < 1) hw_threads = 1;
     g_hw_thread_hint = (size_t)hw_threads;
-    long env_threads = read_env_long("EGGROLL_THREADS", 0);
-    size_t cap = (size_t)hw_threads;
-    if (env_threads > 0 && (size_t)env_threads < cap) cap = (size_t)env_threads;
+    long env_threads = read_env_long("EGGROLL_THREADS", -1);
+    size_t cap;
+    if (env_threads > 0) {
+        cap = (size_t)env_threads;
+    } else {
+        cap = (size_t)hw_threads;
+#if defined(EGGROLL_USE_AVX512_VNNI) || defined(EGGROLL_USE_AVX512)
+        if (cap > 1) cap = (cap + 1) / 2; // default to half cores to reduce AVX-512 throttling
+#endif
+    }
+    if (cap > (size_t)hw_threads) cap = (size_t)hw_threads;
     if (cap < 1) cap = 1;
     g_thread_cap_hint = cap;
 }
