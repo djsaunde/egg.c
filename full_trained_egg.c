@@ -4,12 +4,17 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define EGGROLL_USE_NEON 1
-#endif
-
-#if defined(__AVX2__)
+#elif defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+#include <immintrin.h>
+#define EGGROLL_USE_AVX512_VNNI 1
+#elif defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#define EGGROLL_USE_AVX512 1
+#elif defined(__AVX2__)
 #include <immintrin.h>
 #define EGGROLL_USE_AVX2 1
 #endif
@@ -24,6 +29,10 @@
 
 #if defined(EGGROLL_USE_NEON)
 #define EGGROLL_SIMD_NAME "ARM NEON"
+#elif defined(EGGROLL_USE_AVX512_VNNI)
+#define EGGROLL_SIMD_NAME "x86 AVX-512 VNNI"
+#elif defined(EGGROLL_USE_AVX512)
+#define EGGROLL_SIMD_NAME "x86 AVX-512"
 #elif defined(EGGROLL_USE_AVX2)
 #define EGGROLL_SIMD_NAME "x86 AVX2"
 #else
@@ -80,6 +89,17 @@ typedef struct {
     int8_t ln_out[HIDDEN_DIM];
 } EggModel;
 
+static long read_env_long(const char *name, long fallback) {
+    const char *val = getenv(name);
+    if (!val || !*val) return fallback;
+    char *endptr = NULL;
+    errno = 0;
+    long parsed = strtol(val, &endptr, 10);
+    if (errno != 0 || endptr == val) return fallback;
+    if (parsed <= 0) return fallback;
+    return parsed;
+}
+
 // --- Helper Functions ---
 
 // Forward Declaration
@@ -133,6 +153,52 @@ static inline void gen_noise_vector(uint32_t *rng, int8_t *out, int count) {
     }
 }
 
+#if defined(EGGROLL_USE_AVX512_VNNI) || defined(EGGROLL_USE_AVX512)
+static inline int64_t hsum512_epi64(__m512i v) {
+    __m256i low = _mm512_castsi512_si256(v);
+    __m256i high = _mm512_extracti64x4_epi64(v, 1);
+    __m256i sum256 = _mm256_add_epi64(low, high);
+    __m128i low128 = _mm256_castsi256_si128(sum256);
+    __m128i high128 = _mm256_extracti128_si256(sum256, 1);
+    __m128i sum128 = _mm_add_epi64(low128, high128);
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    sum128 = _mm_add_epi64(sum128, hi64);
+    return (int64_t)_mm_cvtsi128_si64(sum128);
+}
+#endif
+
+#if defined(EGGROLL_USE_AVX512_VNNI)
+static inline int32_t hsum512_epi32(__m512i v) {
+    __m256i low = _mm512_castsi512_si256(v);
+    __m256i high = _mm512_extracti64x4_epi64(v, 1);
+    __m256i sum256 = _mm256_add_epi32(low, high);
+    __m128i low128 = _mm256_castsi256_si128(sum256);
+    __m128i high128 = _mm256_extracti128_si256(sum256, 1);
+    __m128i sum128 = _mm_add_epi32(low128, high128);
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    sum128 = _mm_add_epi32(sum128, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1));
+    sum128 = _mm_add_epi32(sum128, hi32);
+    return _mm_cvtsi128_si32(sum128);
+}
+#endif
+
+#if defined(EGGROLL_USE_AVX512) && !defined(EGGROLL_USE_AVX512_VNNI)
+static inline int32_t hsum512_epi32(__m512i v) {
+    __m256i low = _mm512_castsi512_si256(v);
+    __m256i high = _mm512_extracti64x4_epi64(v, 1);
+    __m256i sum256 = _mm256_add_epi32(low, high);
+    __m128i low128 = _mm256_castsi256_si128(sum256);
+    __m128i high128 = _mm256_extracti128_si256(sum256, 1);
+    __m128i sum128 = _mm_add_epi32(low128, high128);
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    sum128 = _mm_add_epi32(sum128, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1));
+    sum128 = _mm_add_epi32(sum128, hi32);
+    return _mm_cvtsi128_si32(sum128);
+}
+#endif
+
 #if defined(EGGROLL_USE_AVX2)
 static inline int32_t hsum256_epi32(__m256i v) {
     __m128i vlow = _mm256_castsi256_si128(v);
@@ -159,6 +225,69 @@ static inline int32_t dot_product_int8(const int8_t *a, const int8_t *b, int len
         acc_v = vpadalq_s16(acc_v, mul_high);
     }
     int32_t sum = vaddvq_s32(acc_v);
+    for (; i < len; i++) sum += (int32_t)a[i] * (int32_t)b[i];
+    return sum;
+#elif defined(EGGROLL_USE_AVX512_VNNI)
+    const __m512i bias = _mm512_set1_epi8((char)0x80);
+    const __m512i zero = _mm512_setzero_si512();
+    __m512i acc32 = _mm512_setzero_si512();
+    int64_t sum_b = 0;
+    int i = 0;
+    for (; i <= len - 64; i += 64) {
+        __m512i va = _mm512_loadu_si512((const void*)(a + i));
+        __m512i vb = _mm512_loadu_si512((const void*)(b + i));
+        __m512i va_u = _mm512_xor_si512(va, bias);
+        acc32 = _mm512_dpbusd_epi32(acc32, va_u, vb);
+        __m512i vb_u = _mm512_xor_si512(vb, bias);
+        __m512i sad = _mm512_sad_epu8(vb_u, zero);
+        sum_b += hsum512_epi64(sad) - 64LL * 128LL;
+    }
+    int remaining = len - i;
+    if (remaining > 0) {
+        __mmask64 mask = (((__mmask64)1) << remaining) - 1;
+        __m512i va = _mm512_maskz_loadu_epi8(mask, a + i);
+        __m512i vb = _mm512_maskz_loadu_epi8(mask, b + i);
+        __m512i mask_vec = _mm512_movm_epi8(mask);
+        __m512i va_u = _mm512_xor_si512(va, _mm512_and_si512(mask_vec, bias));
+        __m512i vb_u = _mm512_xor_si512(vb, _mm512_and_si512(mask_vec, bias));
+        acc32 = _mm512_dpbusd_epi32(acc32, va_u, vb);
+        __m512i sad = _mm512_sad_epu8(vb_u, zero);
+        sum_b += hsum512_epi64(sad) - (int64_t)remaining * 128LL;
+        i += remaining;
+    }
+    int32_t sum = hsum512_epi32(acc32);
+    sum -= (int32_t)(128LL * sum_b);
+    for (; i < len; i++) sum += (int32_t)a[i] * (int32_t)b[i];
+    return sum;
+#elif defined(EGGROLL_USE_AVX512)
+    __m512i acc32 = _mm512_setzero_si512();
+    int i = 0;
+    for (; i <= len - 64; i += 64) {
+        __m256i va0 = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i va1 = _mm256_loadu_si256((const __m256i*)(a + i + 32));
+        __m256i vb0 = _mm256_loadu_si256((const __m256i*)(b + i));
+        __m256i vb1 = _mm256_loadu_si256((const __m256i*)(b + i + 32));
+
+        __m512i va16_0 = _mm512_cvtepi8_epi16(va0);
+        __m512i va16_1 = _mm512_cvtepi8_epi16(va1);
+        __m512i vb16_0 = _mm512_cvtepi8_epi16(vb0);
+        __m512i vb16_1 = _mm512_cvtepi8_epi16(vb1);
+
+        __m512i prod0 = _mm512_madd_epi16(va16_0, vb16_0);
+        __m512i prod1 = _mm512_madd_epi16(va16_1, vb16_1);
+
+        acc32 = _mm512_add_epi32(acc32, prod0);
+        acc32 = _mm512_add_epi32(acc32, prod1);
+    }
+    int32_t sum = hsum512_epi32(acc32);
+    for (; i <= len - 32; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + i));
+        __m512i va16 = _mm512_cvtepi8_epi16(va);
+        __m512i vb16 = _mm512_cvtepi8_epi16(vb);
+        __m512i prod = _mm512_madd_epi16(va16, vb16);
+        sum += hsum512_epi32(prod);
+    }
     for (; i < len; i++) sum += (int32_t)a[i] * (int32_t)b[i];
     return sum;
 #elif defined(EGGROLL_USE_AVX2)
@@ -199,6 +328,32 @@ static inline int32_t dot_product_int8(const int8_t *a, const int8_t *b, int len
 #endif
 }
 
+#if defined(EGGROLL_USE_AVX512_VNNI)
+static inline int32_t dot_product_int8_vnni_hint(const int8_t *a, const int8_t *b, int len, int32_t sum_b) {
+    const __m512i bias = _mm512_set1_epi8((char)0x80);
+    __m512i acc32 = _mm512_setzero_si512();
+    int i = 0;
+    for (; i <= len - 64; i += 64) {
+        __m512i va = _mm512_loadu_si512((const void*)(a + i));
+        __m512i vb = _mm512_loadu_si512((const void*)(b + i));
+        __m512i va_u = _mm512_xor_si512(va, bias);
+        acc32 = _mm512_dpbusd_epi32(acc32, va_u, vb);
+    }
+    int remaining = len - i;
+    if (remaining > 0) {
+        __mmask64 mask = (((__mmask64)1) << remaining) - 1;
+        __m512i va = _mm512_maskz_loadu_epi8(mask, a + i);
+        __m512i vb = _mm512_maskz_loadu_epi8(mask, b + i);
+        __m512i mask_vec = _mm512_movm_epi8(mask);
+        __m512i va_u = _mm512_xor_si512(va, _mm512_and_si512(mask_vec, bias));
+        acc32 = _mm512_dpbusd_epi32(acc32, va_u, vb);
+    }
+    int32_t sum = hsum512_epi32(acc32);
+    sum -= 128 * sum_b;
+    return sum;
+}
+#endif
+
 #if defined(EGGROLL_USE_PTHREADS)
 typedef void (*ParallelForFunc)(size_t, void*);
 
@@ -220,6 +375,30 @@ typedef struct {
 } ThreadPool;
 
 static ThreadPool g_thread_pool = {0};
+static size_t g_thread_cap_hint = 0;
+static size_t g_hw_thread_hint = 0;
+
+static void init_thread_config_hint(void) {
+    if (g_thread_cap_hint != 0) return;
+    long hw_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    if (hw_threads < 1) hw_threads = 1;
+    g_hw_thread_hint = (size_t)hw_threads;
+    long env_threads = read_env_long("EGGROLL_THREADS", 0);
+    size_t cap = (size_t)hw_threads;
+    if (env_threads > 0 && (size_t)env_threads < cap) cap = (size_t)env_threads;
+    if (cap < 1) cap = 1;
+    g_thread_cap_hint = cap;
+}
+
+static size_t get_thread_cap_hint(void) {
+    init_thread_config_hint();
+    return g_thread_cap_hint;
+}
+
+static size_t get_hw_thread_hint(void) {
+    init_thread_config_hint();
+    return g_hw_thread_hint;
+}
 
 static void parallel_worker_run(ThreadPool *pool) {
     pthread_mutex_lock(&pool->mutex);
@@ -257,10 +436,9 @@ static void *parallel_worker_trampoline(void *arg) {
 
 static void ensure_thread_pool_initialized() {
     if (g_thread_pool.initialized) return;
-    long hw_threads = sysconf(_SC_NPROCESSORS_ONLN);
-    if (hw_threads < 1) hw_threads = 1;
-    g_thread_pool.hw_threads = (size_t)hw_threads;
-    g_thread_pool.worker_count = (size_t)hw_threads;
+    init_thread_config_hint();
+    g_thread_pool.hw_threads = get_hw_thread_hint();
+    g_thread_pool.worker_count = get_thread_cap_hint();
     pthread_mutex_init(&g_thread_pool.mutex, NULL);
     pthread_cond_init(&g_thread_pool.work_cv, NULL);
     pthread_cond_init(&g_thread_pool.done_cv, NULL);
@@ -326,10 +504,19 @@ void matmul_perturbed(
     // 3. Compute Result
     // xW + noise_sign * (xB * A)
     // We iterate over rows (out_dim), computing dot product of in * W[row]
+#if defined(EGGROLL_USE_AVX512_VNNI)
+    int32_t sum_in = 0;
+    for (int i = 0; i < cols; ++i) sum_in += in[i];
+#endif
     
     for(int r=0; r<rows; r++) {
         const int8_t *w_row = &w[r * cols];
+        if (r + 1 < rows) __builtin_prefetch(w_row + cols, 0, 1);
+#if defined(EGGROLL_USE_AVX512_VNNI)
+        int32_t acc = dot_product_int8_vnni_hint(w_row, in, cols, sum_in);
+#else
         int32_t acc = dot_product_int8(in, w_row, cols);
+#endif
 
         if (noise_sign != 0) {
             int32_t noise = (xB * (int32_t)A[r]) * noise_sign;
@@ -341,6 +528,40 @@ void matmul_perturbed(
         else if(res < MIN_VAL) out[r] = MIN_VAL;
         else out[r] = (int8_t)res;
     }
+}
+
+static void run_matmul_bench(int rows, int cols, int iters) {
+    if (rows <= 0 || cols <= 0 || iters <= 0) {
+        printf("Bench args must be positive (rows=%d cols=%d iters=%d)\n", rows, cols, iters);
+        return;
+    }
+    int8_t *input = NULL;
+    int8_t *weights = NULL;
+    int8_t *output = NULL;
+    posix_memalign((void**)&input, 64, (size_t)cols);
+    posix_memalign((void**)&weights, 64, (size_t)rows * (size_t)cols);
+    posix_memalign((void**)&output, 64, (size_t)rows);
+    uint32_t seed = 123;
+    for (int i = 0; i < cols; ++i) input[i] = gen_noise_val(&seed);
+    for (int i = 0; i < rows * cols; ++i) weights[i] = gen_noise_val(&seed);
+    for (int i = 0; i < rows; ++i) output[i] = 0;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; ++i) {
+        matmul_perturbed(input, weights, output, rows, cols, seed + i, 0, 8);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    if (elapsed <= 0.0) elapsed = 1e-9;
+    double macs = (double)rows * (double)cols * 2.0 * (double)iters;
+    double gmacs = macs / elapsed / 1e9;
+    printf("Matmul bench | rows=%d cols=%d iters=%d | %.4f s | %.2f GMAC/s\n",
+           rows, cols, iters, elapsed, gmacs);
+
+    free(input);
+    free(weights);
+    free(output);
 }
 
 // --- Layer Norm [cite: 965] ---
@@ -357,6 +578,18 @@ void egg_ln(const int8_t *x, const int8_t *w, int8_t *out) {
         sum_v = vaddq_s32(sum_v, vreinterpretq_s32_u32(s2));
     }
     sum = vaddvq_s32(sum_v);
+#elif defined(EGGROLL_USE_AVX512)
+    __m512i acc64 = _mm512_setzero_si512();
+    const __m512i zero = _mm512_setzero_si512();
+    for (; i <= HIDDEN_DIM - 64; i += 64) {
+        __m512i xv = _mm512_loadu_si512((const void*)&x[i]);
+        __m512i abs_xv = _mm512_abs_epi8(xv);
+        __m512i sad = _mm512_sad_epu8(abs_xv, zero);
+        acc64 = _mm512_add_epi64(acc64, sad);
+    }
+    uint64_t tmp[8];
+    _mm512_storeu_si512((__m512i*)tmp, acc64);
+    sum = (int32_t)(tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7]);
 #elif defined(EGGROLL_USE_AVX2)
     __m256i acc64 = _mm256_setzero_si256();
     const __m256i zero = _mm256_setzero_si256();
@@ -652,12 +885,33 @@ Dataset load_data(const char *filename) {
     return (Dataset){data, len};
 }
 
-int main() {
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--bench-matmul") == 0) {
+        int rows = (argc > 2) ? atoi(argv[2]) : HIDDEN_DIM;
+        int cols = (argc > 3) ? atoi(argv[3]) : HIDDEN_DIM;
+        int iters = (argc > 4) ? atoi(argv[4]) : 64;
+        run_matmul_bench(rows, cols, iters);
+        return 0;
+    }
+
     srand(time(NULL));
     init_tables();
     Dataset ds = load_data("input.txt");
     printf("Loaded dataset: %ld bytes\n", ds.length);
+#if defined(EGGROLL_USE_PTHREADS)
+    size_t thread_cap = get_thread_cap_hint();
+    size_t hw_threads = get_hw_thread_hint();
+    printf("CPU backend: %s | Parallel: %s (%zu/%zu threads)\n", 
+           EGGROLL_SIMD_NAME, EGGROLL_PARALLEL_BACKEND, thread_cap, hw_threads);
+#else
     printf("CPU backend: %s | Parallel: %s\n", EGGROLL_SIMD_NAME, EGGROLL_PARALLEL_BACKEND);
+#endif
+    long sample_interval = read_env_long("EGGROLL_SAMPLE_INTERVAL", 1);
+    if (sample_interval <= 0) sample_interval = 1;
+    long report_interval = read_env_long("EGGROLL_REPORT_INTERVAL", 1);
+    if (report_interval <= 0) report_interval = 1;
+    long max_steps_override = read_env_long("EGGROLL_MAX_STEPS", 0);
+    int perf_log = (int)read_env_long("EGGROLL_PERF_LOG", 0);
 
     EggModel *model;
     posix_memalign((void**)&model, 16, sizeof(EggModel));
@@ -702,13 +956,16 @@ int main() {
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     long total_tokens = 0;
     long max_steps = (ds.length - 1) / SEQ_LEN;
+    if (max_steps_override > 0 && max_steps_override < max_steps) {
+        max_steps = max_steps_override;
+    }
 
     for(long step=0; step < max_steps; step++) {
         // Use a more robust seed mixing to avoid correlations if time(NULL) doesn't change
         uint32_t step_seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
         int start_idx = step * SEQ_LEN;
         
-        if(step % 10 == 0) {
+        if(step % sample_interval == 0) {
             sample_model(model, &ds.data[start_idx], 30, 30);
             
             int32_t loss_val = 0;
@@ -761,6 +1018,15 @@ int main() {
         update_matrix(model->head, VOCAB_SIZE, HIDDEN_DIM, step_seed+999, pair_fitnesses, POPULATION_SIZE);
 
         total_tokens += SEQ_LEN;
+        if (perf_log && ((step + 1) % report_interval == 0)) {
+            struct timespec perf_time;
+            clock_gettime(CLOCK_MONOTONIC, &perf_time);
+            double elapsed_sec = (perf_time.tv_sec - start_time.tv_sec) + 
+                                 (perf_time.tv_nsec - start_time.tv_nsec) / 1e9;
+            double agg_tps = (elapsed_sec > 0.0) ? (double)total_tokens / elapsed_sec : 0.0;
+            printf("[Perf] Step %ld/%ld complete | Tok/s: %.2f\n", step + 1, max_steps, agg_tps);
+        }
+
     }
 
     printf("Training Done.\n");

@@ -27,14 +27,38 @@ clang -O3 full_trained_egg.c -o egg
 ./egg
 ```
 
-#### Linux / x86 CPU (AVX2 + Pthreads)
+#### Linux / x86 CPU (AVX2 / AVX-512 + Pthreads)
 ```bash
 # AVX2 build (include -lm for exp2)
 clang -O3 -mavx2 -mfma -pthread full_trained_egg.c -o egg -lm
 ./egg
+
+# Zen 4 / AVX-512 build (enables the wider SIMD path)
+clang -O3 -mavx512f -mavx512bw -mfma -pthread full_trained_egg.c -o egg -lm
+./egg
+
+# Zen 4 / AVX-512 VNNI build (enables the dpbusd path)
+clang -O3 -mavx512f -mavx512bw -mavx512vnni -mfma -pthread full_trained_egg.c -o egg -lm
+./egg
 ```
 
+The binary picks the widest SIMD path supported by the compile flags you pass, so prefer the AVX-512 command on Zen 4 or newer.
+
 If you want to use OpenMP instead of the built-in thread pool, install Clang's OpenMP runtime (e.g., `sudo apt-get install libomp-dev`) and add `-fopenmp` to the compile command.
+
+#### Matmul Microbench + Runtime Knobs
+
+```bash
+# Quick matmul benchmark (rows cols iters, defaults to 512 512 64)
+./egg --bench-matmul 512 512 200
+```
+
+Useful environment variables when benchmarking:
+
+- `EGGROLL_THREADS=8` caps the pthread worker pool (defaults to detected core count).
+- `EGGROLL_MAX_STEPS=1` exits after a single training iteration.
+- `EGGROLL_SAMPLE_INTERVAL=5` reduces how often samples/loss are printed.
+- `EGGROLL_REPORT_INTERVAL=1` together with `EGGROLL_PERF_LOG=1` prints post-step aggregate tok/s.
 
 #### NVIDIA GPU (CUDA)
 ```bash
