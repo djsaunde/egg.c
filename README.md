@@ -29,7 +29,8 @@ clang -O3 full_trained_egg.c -o egg
 
 #### Linux / x86 CPU (AVX2 + Pthreads)
 ```bash
-clang -O3 -mavx2 -mfma -pthread full_trained_egg.c -o egg
+# AVX2 build (include -lm for exp2)
+clang -O3 -mavx2 -mfma -pthread full_trained_egg.c -o egg -lm
 ./egg
 ```
 
