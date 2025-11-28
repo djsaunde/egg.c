@@ -4,16 +4,47 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
+#define EGGROLL_USE_NEON 1
+#endif
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define EGGROLL_USE_AVX2 1
+#endif
+
+#if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#define EGGROLL_USE_PTHREADS 1
+#endif
+
+#if defined(EGGROLL_USE_NEON)
+#define EGGROLL_SIMD_NAME "ARM NEON"
+#elif defined(EGGROLL_USE_AVX2)
+#define EGGROLL_SIMD_NAME "x86 AVX2"
+#else
+#define EGGROLL_SIMD_NAME "Scalar"
+#endif
+
+#if defined(__APPLE__)
+#define EGGROLL_PARALLEL_BACKEND "Grand Central Dispatch"
+#elif defined(EGGROLL_USE_PTHREADS)
+#define EGGROLL_PARALLEL_BACKEND "Pthreads"
+#else
+#define EGGROLL_PARALLEL_BACKEND "Serial loop"
+#endif
 
 // --- Configuration [cite: 275, 277, 288] ---
 #define VOCAB_SIZE 256        // Byte-level tokenization
-#define HIDDEN_DIM 512        // Model width
-#define N_LAYERS 4            // Number of layers
-#define SEQ_LEN 4096            // Sequence length for BPTT (truncated)
-#define POPULATION_SIZE 128    // Number of perturbations per step
-#define BATCH_SIZE 8          // Parallel streams
+#define HIDDEN_DIM 128        // Model width
+#define N_LAYERS 2            // Number of layers
+#define SEQ_LEN 512            // Sequence length for BPTT (truncated)
+#define POPULATION_SIZE 16    // Number of perturbations per step
+#define BATCH_SIZE 2          // Parallel streams
 #define FIXED_POINT 4         // 4 bits for fractional part
 #define SIGMA_SHIFT 4         // Noise scale (bitwise shift)
 #define UPDATE_THRESHOLD 160  // Votes needed to flip a weight [cite: 1023]
@@ -81,10 +112,8 @@ static inline int8_t gen_noise_val(uint32_t *rng) {
     return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
 }
 
-// NEON Noise Generation
-// Generates 16 int8 values [-15, 15] roughly following the distribution
-// Replicates logic: sign * value
-static inline void gen_noise_vector_neon(uint32_t *rng, int8_t *out, int count) {
+// Noise generation shared by all backends
+static inline void gen_noise_vector(uint32_t *rng, int8_t *out, int count) {
     for (int i = 0; i < count; i += 16) {
         // Generate random bits
         uint32_t r0 = xorshift32(rng);
@@ -104,6 +133,179 @@ static inline void gen_noise_vector_neon(uint32_t *rng, int8_t *out, int count) 
     }
 }
 
+#if defined(EGGROLL_USE_AVX2)
+static inline int32_t hsum256_epi32(__m256i v) {
+    __m128i vlow = _mm256_castsi256_si128(v);
+    __m128i vhigh = _mm256_extracti128_si256(v, 1);
+    __m128i sum128 = _mm_add_epi32(vlow, vhigh);
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    sum128 = _mm_add_epi32(sum128, hi64);
+    __m128i hi32 = _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1));
+    sum128 = _mm_add_epi32(sum128, hi32);
+    return _mm_cvtsi128_si32(sum128);
+}
+#endif
+
+static inline int32_t dot_product_int8(const int8_t *a, const int8_t *b, int len) {
+#if defined(EGGROLL_USE_NEON)
+    int32x4_t acc_v = vdupq_n_s32(0);
+    int i = 0;
+    for (; i <= len - 16; i += 16) {
+        int8x16_t va = vld1q_s8(&a[i]);
+        int8x16_t vb = vld1q_s8(&b[i]);
+        int16x8_t mul_low = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
+        int16x8_t mul_high = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+        acc_v = vpadalq_s16(acc_v, mul_low);
+        acc_v = vpadalq_s16(acc_v, mul_high);
+    }
+    int32_t sum = vaddvq_s32(acc_v);
+    for (; i < len; i++) sum += (int32_t)a[i] * (int32_t)b[i];
+    return sum;
+#elif defined(EGGROLL_USE_AVX2)
+    __m256i acc32 = _mm256_setzero_si256();
+    int i = 0;
+    for (; i <= len - 32; i += 32) {
+        __m128i va_lo = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i va_hi = _mm_loadu_si128((const __m128i*)(a + i + 16));
+        __m128i vb_lo = _mm_loadu_si128((const __m128i*)(b + i));
+        __m128i vb_hi = _mm_loadu_si128((const __m128i*)(b + i + 16));
+
+        __m256i va16_lo = _mm256_cvtepi8_epi16(va_lo);
+        __m256i va16_hi = _mm256_cvtepi8_epi16(va_hi);
+        __m256i vb16_lo = _mm256_cvtepi8_epi16(vb_lo);
+        __m256i vb16_hi = _mm256_cvtepi8_epi16(vb_hi);
+
+        __m256i prod_lo = _mm256_madd_epi16(va16_lo, vb16_lo);
+        __m256i prod_hi = _mm256_madd_epi16(va16_hi, vb16_hi);
+
+        acc32 = _mm256_add_epi32(acc32, prod_lo);
+        acc32 = _mm256_add_epi32(acc32, prod_hi);
+    }
+    int32_t sum = hsum256_epi32(acc32);
+    for (; i <= len - 16; i += 16) {
+        __m128i va = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i vb = _mm_loadu_si128((const __m128i*)(b + i));
+        __m256i va16 = _mm256_cvtepi8_epi16(va);
+        __m256i vb16 = _mm256_cvtepi8_epi16(vb);
+        __m256i prod = _mm256_madd_epi16(va16, vb16);
+        sum += hsum256_epi32(prod);
+    }
+    for (; i < len; i++) sum += (int32_t)a[i] * (int32_t)b[i];
+    return sum;
+#else
+    int32_t sum = 0;
+    for (int i = 0; i < len; i++) sum += (int32_t)a[i] * (int32_t)b[i];
+    return sum;
+#endif
+}
+
+#if defined(EGGROLL_USE_PTHREADS)
+typedef void (*ParallelForFunc)(size_t, void*);
+
+typedef struct {
+    pthread_t *threads;
+    size_t worker_count;
+    size_t hw_threads;
+    pthread_mutex_t mutex;
+    pthread_cond_t work_cv;
+    pthread_cond_t done_cv;
+    size_t next_index;
+    size_t total;
+    size_t running_workers;
+    ParallelForFunc func;
+    void *ctx;
+    int work_available;
+    int stop;
+    int initialized;
+} ThreadPool;
+
+static ThreadPool g_thread_pool = {0};
+
+static void parallel_worker_run(ThreadPool *pool) {
+    pthread_mutex_lock(&pool->mutex);
+    while (1) {
+        while (!pool->work_available && !pool->stop) {
+            pthread_cond_wait(&pool->work_cv, &pool->mutex);
+        }
+        if (pool->stop) {
+            pthread_mutex_unlock(&pool->mutex);
+            break;
+        }
+        if (pool->next_index >= pool->total) {
+            pthread_cond_wait(&pool->done_cv, &pool->mutex);
+            continue;
+        }
+        size_t idx = pool->next_index++;
+        pool->running_workers++;
+        pthread_mutex_unlock(&pool->mutex);
+
+        pool->func(idx, pool->ctx);
+
+        pthread_mutex_lock(&pool->mutex);
+        pool->running_workers--;
+        if (pool->next_index >= pool->total && pool->running_workers == 0) {
+            pool->work_available = 0;
+            pthread_cond_broadcast(&pool->done_cv);
+        }
+    }
+}
+
+static void *parallel_worker_trampoline(void *arg) {
+    parallel_worker_run((ThreadPool*)arg);
+    return NULL;
+}
+
+static void ensure_thread_pool_initialized() {
+    if (g_thread_pool.initialized) return;
+    long hw_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    if (hw_threads < 1) hw_threads = 1;
+    g_thread_pool.hw_threads = (size_t)hw_threads;
+    g_thread_pool.worker_count = (size_t)hw_threads;
+    pthread_mutex_init(&g_thread_pool.mutex, NULL);
+    pthread_cond_init(&g_thread_pool.work_cv, NULL);
+    pthread_cond_init(&g_thread_pool.done_cv, NULL);
+    g_thread_pool.threads = (pthread_t*)malloc(g_thread_pool.worker_count * sizeof(pthread_t));
+    for (size_t t = 0; t < g_thread_pool.worker_count; t++) {
+        pthread_create(&g_thread_pool.threads[t], NULL, parallel_worker_trampoline, &g_thread_pool);
+    }
+    g_thread_pool.initialized = 1;
+}
+
+static void shutdown_thread_pool() {
+    if (!g_thread_pool.initialized) return;
+    pthread_mutex_lock(&g_thread_pool.mutex);
+    g_thread_pool.stop = 1;
+    pthread_cond_broadcast(&g_thread_pool.work_cv);
+    pthread_cond_broadcast(&g_thread_pool.done_cv);
+    pthread_mutex_unlock(&g_thread_pool.mutex);
+    for (size_t t = 0; t < g_thread_pool.worker_count; t++) {
+        pthread_join(g_thread_pool.threads[t], NULL);
+    }
+    free(g_thread_pool.threads);
+    pthread_mutex_destroy(&g_thread_pool.mutex);
+    pthread_cond_destroy(&g_thread_pool.work_cv);
+    pthread_cond_destroy(&g_thread_pool.done_cv);
+    memset(&g_thread_pool, 0, sizeof(g_thread_pool));
+}
+
+static void run_parallel_for(size_t total, ParallelForFunc func, void *ctx) {
+    if (total == 0) return;
+    ensure_thread_pool_initialized();
+    pthread_mutex_lock(&g_thread_pool.mutex);
+    g_thread_pool.total = total;
+    g_thread_pool.next_index = 0;
+    g_thread_pool.running_workers = 0;
+    g_thread_pool.func = func;
+    g_thread_pool.ctx = ctx;
+    g_thread_pool.work_available = 1;
+    pthread_cond_broadcast(&g_thread_pool.work_cv);
+    while (g_thread_pool.work_available) {
+        pthread_cond_wait(&g_thread_pool.done_cv, &g_thread_pool.mutex);
+    }
+    pthread_mutex_unlock(&g_thread_pool.mutex);
+}
+#endif
+
 // --- The Core "Rank-1 Perturbed Matrix Mul" (NEON Optimized) ---
 void matmul_perturbed(
     const int8_t *in, const int8_t *w, int8_t *out, 
@@ -116,53 +318,18 @@ void matmul_perturbed(
     int8_t B[cols];
     
     uint32_t rng = layer_seed;
-    gen_noise_vector_neon(&rng, A, rows);
-    gen_noise_vector_neon(&rng, B, cols);
+    gen_noise_vector(&rng, A, rows);
+    gen_noise_vector(&rng, B, cols);
 
-    // 2. Compute xB (Projection onto B)
-    int32_t xB = 0;
-    // Vectorize dot product in * B
-    int32x4_t acc_v = vdupq_n_s32(0);
-    int i = 0;
-    for (; i <= cols - 16; i += 16) {
-        int8x16_t in_v = vld1q_s8(&in[i]);
-        int8x16_t b_v = vld1q_s8(&B[i]);
-        // Multiply int8->int16, accumulate to int32
-        int16x8_t mul_low = vmull_s8(vget_low_s8(in_v), vget_low_s8(b_v));
-        int16x8_t mul_high = vmull_s8(vget_high_s8(in_v), vget_high_s8(b_v));
-        acc_v = vpadalq_s16(acc_v, mul_low);
-        acc_v = vpadalq_s16(acc_v, mul_high);
-    }
-    xB = vaddvq_s32(acc_v);
-    // Remainder
-    for (; i < cols; i++) {
-        xB += (int32_t)in[i] * (int32_t)B[i];
-    }
+    int32_t xB = dot_product_int8(in, B, cols);
 
     // 3. Compute Result
     // xW + noise_sign * (xB * A)
     // We iterate over rows (out_dim), computing dot product of in * W[row]
     
     for(int r=0; r<rows; r++) {
-        int32_t acc = 0;
-        int32x4_t row_acc_v = vdupq_n_s32(0);
-        
         const int8_t *w_row = &w[r * cols];
-        
-        int c = 0;
-        for (; c <= cols - 16; c += 16) {
-            int8x16_t in_v = vld1q_s8(&in[c]);
-            int8x16_t w_v = vld1q_s8(&w_row[c]);
-            
-            int16x8_t mul_low = vmull_s8(vget_low_s8(in_v), vget_low_s8(w_v));
-            int16x8_t mul_high = vmull_s8(vget_high_s8(in_v), vget_high_s8(w_v));
-            row_acc_v = vpadalq_s16(row_acc_v, mul_low);
-            row_acc_v = vpadalq_s16(row_acc_v, mul_high);
-        }
-        acc = vaddvq_s32(row_acc_v);
-        for (; c < cols; c++) {
-            acc += (int32_t)in[c] * (int32_t)w_row[c];
-        }
+        int32_t acc = dot_product_int8(in, w_row, cols);
 
         if (noise_sign != 0) {
             int32_t noise = (xB * (int32_t)A[r]) * noise_sign;
@@ -179,21 +346,30 @@ void matmul_perturbed(
 // --- Layer Norm [cite: 965] ---
 void egg_ln(const int8_t *x, const int8_t *w, int8_t *out) {
     int32_t sum = 0;
-    // NEON Sum Abs
-    int32x4_t sum_v = vdupq_n_s32(0);
     int i = 0;
+#if defined(EGGROLL_USE_NEON)
+    int32x4_t sum_v = vdupq_n_s32(0);
     for(; i <= HIDDEN_DIM - 16; i+=16) {
         int8x16_t xv = vld1q_s8(&x[i]);
         int8x16_t abs_xv = vabsq_s8(xv);
-        // int8 -> uint16 -> accumulate to uint32/int32?
-        // vpadal summation chain needed or simpler:
-        // abs is positive, safe to treat as unsigned or signed positive.
-        // vpaddl_u8 -> u16, vpaddl_u16 -> u32
         uint16x8_t s1 = vpaddlq_u8(vreinterpretq_u8_s8(abs_xv));
-        uint32x4_t s2 = vpaddlq_u16(s1); // accumulates 16 bytes into 4 ints
+        uint32x4_t s2 = vpaddlq_u16(s1);
         sum_v = vaddq_s32(sum_v, vreinterpretq_s32_u32(s2));
     }
     sum = vaddvq_s32(sum_v);
+#elif defined(EGGROLL_USE_AVX2)
+    __m256i acc64 = _mm256_setzero_si256();
+    const __m256i zero = _mm256_setzero_si256();
+    for (; i <= HIDDEN_DIM - 32; i += 32) {
+        __m256i xv = _mm256_loadu_si256((const __m256i*)&x[i]);
+        __m256i abs_xv = _mm256_abs_epi8(xv);
+        __m256i sad = _mm256_sad_epu8(abs_xv, zero);
+        acc64 = _mm256_add_epi64(acc64, sad);
+    }
+    uint64_t tmp[4];
+    _mm256_storeu_si256((__m256i*)tmp, acc64);
+    sum = (int32_t)(tmp[0] + tmp[1] + tmp[2] + tmp[3]);
+#endif
     for(; i<HIDDEN_DIM; i++) sum += abs(x[i]);
 
     if(sum == 0) sum = 1;
@@ -356,8 +532,8 @@ void update_matrix(
         int8_t A_temp[MAX_MATRIX_DIM];
         int8_t B_temp[MAX_MATRIX_DIM];
         
-        gen_noise_vector_neon(&rng, A_temp, rows);
-        gen_noise_vector_neon(&rng, B_temp, cols);
+        gen_noise_vector(&rng, A_temp, rows);
+        gen_noise_vector(&rng, B_temp, cols);
 
         if (f == 0) {
             for(int r=0; r<rows; r++) A_T[r][p] = 0;
@@ -374,38 +550,40 @@ void update_matrix(
 
         for(int c=0; c<cols; c++) {
             int8_t *b_ptr = B_T[c];
-            
-            // Vectorized dot product across population pairs
-            int32x4_t acc_v = vdupq_n_s32(0);
-            
-            // Process in blocks of 16 (NEON int8x16)
-            // Assumption: pairs is a multiple of 16 or we handle tail roughly. 
-            // For now, assuming POPULATION_SIZE is multiple of 32.
-            for(int p=0; p <= pairs - 16; p += 16) {
-                int8x16_t va = vld1q_s8(&a_ptr[p]);
-                int8x16_t vb = vld1q_s8(&b_ptr[p]);
-                int16x8_t prod1 = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
-                int16x8_t prod2 = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
-                acc_v = vpadalq_s16(acc_v, prod1);
-                acc_v = vpadalq_s16(acc_v, prod2);
-            }
-            // Handle remaining pairs if any (scalar fallback or smaller vector)
-            // Since MAX_POP_PAIRS comes from POPULATION_SIZE, let's keep it simple.
-            // The original logic was fixed 32. This loop handles N*16.
-
-            int32_t vote = vaddvq_s32(acc_v);
-
-            // Scalar loop for remainder not needed if we ensure population size is aligned,
-            // but for safety:
-            for(int p = (pairs & ~15); p < pairs; p++) {
-                vote += (int32_t)a_ptr[p] * (int32_t)b_ptr[p];
-            }
+            int32_t vote = dot_product_int8(a_ptr, b_ptr, pairs);
 
             // Apply Update
             if(vote > UPDATE_THRESHOLD && w_row[c] < MAX_VAL) w_row[c]++;
             else if(vote < -UPDATE_THRESHOLD && w_row[c] > MIN_VAL) w_row[c]--;
         }
     }
+}
+
+typedef struct {
+    EggModel *model;
+    Dataset *ds;
+    long start_idx;
+    uint32_t step_seed;
+    RecurrentState *pop_states;
+    int *pair_fitnesses;
+    long stride;
+    long ds_len_minus_seq;
+} PopulationEvalContext;
+
+static void process_population_pair(size_t p_idx, void *ctx_void) {
+    PopulationEvalContext *ctx = (PopulationEvalContext*)ctx_void;
+    uint32_t p_seed = ctx->step_seed + (uint32_t)p_idx;
+    int8_t local_logits[VOCAB_SIZE];
+    int32_t loss_pos = 0, loss_neg = 0;
+
+    long stream_idx = (ctx->start_idx + (p_idx * ctx->stride)) % ctx->ds_len_minus_seq;
+
+    forward_pass(ctx->model, &ctx->ds->data[stream_idx], &ctx->ds->data[stream_idx+1], SEQ_LEN, local_logits, &loss_pos, p_seed, 1, &ctx->pop_states[p_idx*2]);
+    forward_pass(ctx->model, &ctx->ds->data[stream_idx], &ctx->ds->data[stream_idx+1], SEQ_LEN, local_logits, &loss_neg, p_seed, -1, &ctx->pop_states[p_idx*2+1]);
+
+    if (loss_pos < loss_neg) ctx->pair_fitnesses[p_idx] = 1;
+    else if (loss_neg < loss_pos) ctx->pair_fitnesses[p_idx] = -1;
+    else ctx->pair_fitnesses[p_idx] = 0;
 }
 
 // --- Sampling Helper ---
@@ -479,6 +657,7 @@ int main() {
     init_tables();
     Dataset ds = load_data("input.txt");
     printf("Loaded dataset: %ld bytes\n", ds.length);
+    printf("CPU backend: %s | Parallel: %s\n", EGGROLL_SIMD_NAME, EGGROLL_PARALLEL_BACKEND);
 
     EggModel *model;
     posix_memalign((void**)&model, 16, sizeof(EggModel));
@@ -544,22 +723,30 @@ int main() {
             printf("Step %ld/%ld | Loss: %.4f | Tok/s: %.2f\n", step, max_steps, (double)loss_val / (SEQ_LEN * (1 << FIXED_POINT)), tps);
         }
 
-    dispatch_apply(POPULATION_SIZE / 2, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t p_idx) {
-        uint32_t p_seed = step_seed + (uint32_t)p_idx;
-        int8_t local_logits[VOCAB_SIZE];
-        int32_t loss_pos = 0, loss_neg = 0;
-        
-        // Multi-stream: Distribute pairs across the dataset
-        long stride = ds.length / (POPULATION_SIZE / 2);
-        long stream_idx = (start_idx + (p_idx * stride)) % (ds.length - SEQ_LEN);
-
-        forward_pass(model, &ds.data[stream_idx], &ds.data[stream_idx+1], SEQ_LEN, local_logits, &loss_pos, p_seed, 1, &pop_states[p_idx*2]);
-        forward_pass(model, &ds.data[stream_idx], &ds.data[stream_idx+1], SEQ_LEN, local_logits, &loss_neg, p_seed, -1, &pop_states[p_idx*2+1]);
-
-        if (loss_pos < loss_neg) pair_fitnesses[p_idx] = 1;
-            else if (loss_neg < loss_pos) pair_fitnesses[p_idx] = -1;
-            else pair_fitnesses[p_idx] = 0;
+        size_t pop_pairs = POPULATION_SIZE / 2;
+        if (pop_pairs == 0) pop_pairs = 1;
+        PopulationEvalContext eval_ctx = {
+            .model = model,
+            .ds = &ds,
+            .start_idx = start_idx,
+            .step_seed = step_seed,
+            .pop_states = pop_states,
+            .pair_fitnesses = pair_fitnesses,
+            .stride = (long)(ds.length / pop_pairs),
+            .ds_len_minus_seq = (ds.length > SEQ_LEN) ? (ds.length - SEQ_LEN) : 1
+        };
+        if (eval_ctx.stride <= 0) eval_ctx.stride = 1;
+#if defined(__APPLE__)
+        dispatch_apply(pop_pairs, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t p_idx) {
+            process_population_pair(p_idx, &eval_ctx);
         });
+#elif defined(EGGROLL_USE_PTHREADS)
+        run_parallel_for(pop_pairs, process_population_pair, &eval_ctx);
+#else
+        for (size_t p_idx = 0; p_idx < pop_pairs; ++p_idx) {
+            process_population_pair(p_idx, &eval_ctx);
+        }
+#endif
 
         for(int l=0; l<N_LAYERS; l++) {
             uint32_t l_seed = step_seed + (l * 100);
@@ -579,5 +766,8 @@ int main() {
     printf("Training Done.\n");
     free(ds.data); free(model); free(logits); free(pair_fitnesses);
     free(pop_states);
+#if defined(EGGROLL_USE_PTHREADS)
+    shutdown_thread_pool();
+#endif
     return 0;
 }
